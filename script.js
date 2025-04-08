@@ -8,6 +8,7 @@ import { markedHighlight } from "https://cdn.jsdelivr.net/npm/marked-highlight@2
 import hljs from "https://cdn.jsdelivr.net/npm/highlight.js@11/+esm";
 import { Chart, registerables } from "https://cdn.jsdelivr.net/npm/chart.js@4/+esm";
 import { asyncLLM } from "https://cdn.jsdelivr.net/npm/asyncllm@2";
+
 // Initialize SQLite
 const defaultDB = "@";
 const sqlite3 = await sqlite3InitModule({ printErr: console.error });
@@ -150,10 +151,9 @@ const DB = {
           required: ["questions"],
           additionalProperties: false,
         },
-        streaming: false,
       });
       if (response.error) DB.questionInfo.error = response.error;
-      else DB.questionInfo.questions = JSON.parse(response).questions;
+      else DB.questionInfo.questions = response.questions;
       DB.questionInfo.schema = JSON.stringify(DB.schema());
     }
     return DB.questionInfo;
@@ -373,7 +373,7 @@ $tablesContainer.addEventListener("submit", async (e) => {
   e.preventDefault();
   const formData = new FormData(e.target);
   const query = formData.get("query");
-  render(html``, $sql);
+  render(html`<div class="text-center my-3">${loading}</div>`, $sql);
   render(html``, $result);
   const result = await llm({
     system: `You are an expert SQLite query writer. The user has a SQLite dataset.
@@ -398,36 +398,56 @@ Always use [Table].[Column].
 `,
     user: query,
   });
+  render(html`${unsafeHTML(marked.parse(result))}`, $sql);
 
   // Extract everything inside {lang?}...```
   const sql = result.match(/```.*?\n(.*?)```/s)?.[1] ?? result;
   try {
-    render(loading, $loading);
     const data = db.exec(sql, { rowMode: "object" });
-    render(html``, $loading);
-    latestQueryResult = data;
 
     // Render the data using the utility function
-    const formattedResult = await llm({
-      system: `Format the following raw answer into a well-structured, human-readable response based on the given question. 
-                  Ensure the response is clear, concise, and appropriately detailed—neither too short nor overly verbose. 
-                  Preserve all relevant information while improving readability. 
-                  The response should feel natural and professional.`,
-      user: `The query: ${query}\n\nThe raw answer is given below:\n\n${JSON.stringify(data, null, 2)}`,
-      data: data,
-      format: true,
-    });
-
-    chatHistory.push({ question: query, sql: sql, explanation: result, formattedResult: formattedResult, data: data });
+    if (data.length > 0) {
+      latestQueryResult = data;
+      const actions = `
+        <div class="row align-items-center g-2">
+          <div class="col-auto">
+            <button id="download-button" type="button" class="btn btn-primary">
+              <i class="bi bi-filetype-csv"></i>
+              Download CSV
+            </button>
+          </div>
+          <div class="col">
+            <input
+              type="text"
+              id="chart-input"
+              name="chart-input"
+              class="form-control"
+              placeholder="Describe what you want to chart"
+              value="Draw the most appropriate chart to visualize this data"
+            />
+          </div>
+          <div class="col-auto">
+            <button id="chart-button" type="button" class="btn btn-primary">
+              <i class="bi bi-bar-chart-line"></i>
+              Draw Chart
+            </button>
+          </div>
+        </div>
+      `;
+      const tableHtml = renderTable(data.slice(0, 100));
+      render([actions, tableHtml], $result);
+    } else {
+      render(html`<p>No results found.</p>`, $result);
+    }
   } catch (e) {
-    const container = document.getElementById("result");
-    container.insertAdjacentHTML("beforeend", get_node_when_error(e.message));
-    render(html``, $loading);
+    render(html`<div class="alert alert-danger">${e.message}</div>`, $result);
+    console.error(e);
   }
 });
 
 // --------------------------------------------------------------------
 // Utilities
+
 function notify(cls, title, message) {
   $toast.querySelector(".toast-title").textContent = title;
   $toast.querySelector(".toast-body").textContent = message;
@@ -436,72 +456,51 @@ function notify(cls, title, message) {
   $toastHeader.classList.add(`text-bg-${cls}`);
   toast.show();
 }
+
 async function llm({ system, user, schema, format = false, data = [], streaming = true }) {
-  let errormessage = "";
-  render(loading, $loading);
-
-  let parentnode = document.getElementById("result");
-  let childnode = `<div class="card mb-3 chat-history"></div>`;
-  streaming ? parentnode.insertAdjacentHTML("beforeend", childnode) : "";
-  let lastelement = parentnode.lastElementChild;
-  let currentChunk = "";
+  const response = await fetch("https://llmfoundry.straive.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}:datachat` },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0,
+      ...(schema ? { response_format: { type: "json_schema", json_schema: { name: "response", strict: true, schema } } } : {}),
+    }),
+  }).then((r) => r.json());
+  if (response.error) return response;
+  const content = response.choices?.[0]?.message?.content;
   try {
-    for await (const data of asyncLLM("https://llmfoundry.straive.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}:datachat` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        temperature: 0,
-        ...(schema ? { response_format: { type: "json_schema", json_schema: { name: "response", strict: true, schema } } } : {}),
-        stream: true,
-      }),
-    })) {
-      if (data.error) {
-        throw new Error(data.error.message || "LLM API Error");
-      }
-
-      if (data.content) {
-        render(html``, $loading);
-        currentChunk = data.content;
-      }
-      streaming
-        ? (lastelement.innerHTML = `<div class="card-header mb-2">
-              <strong>${format ? "Result " : "Question: "} </strong> ${format ? "" : user}
-            </div>
-            <div id="chat" class="mb-3 p-4"> ${marked.parse(currentChunk)}</div>`)
-        : "";
-    }
-    if (streaming && format) {
-      let tableHtml = data.length > 0 ? renderTable(data.slice(0, 100)) : ``;
-      lastelement.innerHTML += actions + tableHtml;
-    }
-    return currentChunk;
+    return schema ? JSON.parse(content) : content;
   } catch (e) {
-    errormessage = e.message;
-  } finally {
-    format ? (parentnode.innerHTML += get_node_when_error(errormessage)) : "";
+    return { error: e };
   }
 }
 
 // Utility function to render a table
 function renderTable(data) {
   const columns = Object.keys(data[0]);
-  return `
-      <table class="table table-striped table-hover">
-        <thead>
-          <tr>
-            ${columns.map((col) => `<th>${col}</th>`).join("")}
-          </tr>
-        </thead>
-        <tbody>
-        ${data.map((row) => `<tr>${columns.map((col) => `<td>${row[col]}</td>`).join("")}</tr>`).join("")}
-        </tbody>
-      </table>
-    `;
+  return html`
+    <table class="table table-striped table-hover">
+      <thead>
+        <tr>
+          ${columns.map((col) => html`<th>${col}</th>`)}
+        </tr>
+      </thead>
+      <tbody>
+        ${data.map(
+          (row) => html`
+            <tr>
+              ${columns.map((col) => html`<td>${row[col]}</td>`)}
+            </tr>
+          `
+        )}
+      </tbody>
+    </table>
+  `;
 }
 
 $result.addEventListener("click", async (e) => {
@@ -538,7 +537,6 @@ IMPORTANT: ${$result.querySelector("#chart-input").value}
 `;
     render(loading, $chartCode);
     const result = await llm({ system, user, streaming: false });
-    render(html``, $chartCode);
     // render(html`${unsafeHTML(marked.parse(result))}`, $chartCode);//not showing code behind the chart
     const code = result.match(/```js\n(.*?)\n```/s)?.[1];
     if (!code) {
@@ -569,7 +567,7 @@ IMPORTANT: ${$result.querySelector("#chart-input").value}
     }
     document.getElementById("action").remove();
     document.getElementById("improvement-container").remove();
-    if (latestChart) latestChart.destroy();
+
     render(loading, $loading);
 
     const lastChat = chatHistory[chatHistory.length - 1];
@@ -591,9 +589,7 @@ Explain the changes you're making and why, then provide the new SQL query.`,
     const newSql = result.match(/```.*?\n(.*?)```/s)?.[1] ?? result;
 
     try {
-      render(loading, $loading);
       const data = db.exec(newSql, { rowMode: "object" });
-      render(html``, $loading);
       latestQueryResult = data;
       // Get new formatted results using the last chat entry for context
       const formattedResult = await llm({
@@ -608,8 +604,7 @@ Explain the changes you're making and why, then provide the new SQL query.`,
       chatHistory.push({ question: userDescription, sql: newSql, explanation: result, formattedResult: formattedResult, data: data });
       render(html``, $loading);
     } catch (e) {
-      const container = document.getElementById("result");
-      container.insertAdjacentHTML("beforeend", get_node_when_error(e.message));
+      document.getElementById("result").insertAdjacentHTML("beforeend", get_node_when_error(e.message));
       render(html``, $loading);
     }
   }
@@ -641,30 +636,3 @@ function get_node_when_error(e) {
 </div>`;
   return childnode;
 }
-
-const actions = `
-    <div id="action" class="row align-items-center g-2">
-      <div class="col-auto">
-        <button id="download-button" type="button" class="btn btn-primary">
-          <i class="bi bi-filetype-csv"></i>
-          Download CSV
-        </button>
-      </div>
-      <div class="col">
-        <input
-          type="text"
-          id="chart-input"
-          name="chart-input"
-          class="form-control"
-          placeholder="Describe what you want to chart"
-          value="Draw the most appropriate chart to visualize this data"
-        />
-      </div>
-      <div class="col-auto">
-        <button id="chart-button" type="button" class="btn btn-primary">
-          <i class="bi bi-bar-chart-line"></i>
-          Draw Chart
-        </button>
-      </div>
-    </div>
-  `;
